@@ -2,5 +2,5 @@ yfinance
 pandas
 numpy
 xgboost
-scikit-learn
 requests
+joblib
