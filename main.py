@@ -3,10 +3,9 @@ import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import xgboost as xgb
+import joblib
 
 def enviar_telegram(mensaje):
-    # Lee las credenciales de forma segura desde la nube
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -14,65 +13,71 @@ def enviar_telegram(mensaje):
     requests.post(url, json=payload)
 
 def ejecutar_estrategia():
-    print("Descargando datos históricos...")
-    btc = yf.download('BTC-USD', start='2020-01-01', progress=False)
-    if isinstance(btc.columns, pd.MultiIndex):
-        btc.columns = btc.columns.get_level_values(0)
-    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        btc[col] = btc[col].astype(float)
+    print("Descargando datos recientes (60 días)...")
+    df_live = yf.download("BTC-USD", period="60d", progress=False)
+    
+    if isinstance(df_live.columns, pd.MultiIndex):
+        df_live.columns = df_live.columns.droplevel(1)
         
-    print("Calculando características...")
-    btc['ret_1d'] = btc['Close'].pct_change(1)
-    btc['ret_3d'] = btc['Close'].pct_change(3)
-    btc['ret_5d'] = btc['Close'].pct_change(5)
-    btc['vol_14d'] = btc['ret_1d'].rolling(14).std()
-    btc['sma_50'] = btc['Close'].rolling(window=50).mean()
-    btc['sma_200'] = btc['Close'].rolling(window=200).mean()
-    btc['dist_sma_50'] = (btc['Close'] - btc['sma_50']) / btc['sma_50']
+    df_live = df_live.dropna()
+
+    print("Calculando características de micro-momentum del equipo...")
+    df_live['Return'] = df_live['Close'].pct_change()
     
-    delta = btc['Close'].diff()
-    ganancia = delta.where(delta > 0, 0).rolling(window=14).mean()
-    perdida = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = ganancia / (perdida + 1e-9)
-    btc['rsi_14'] = 100 - (100 / (1 + rs))
-    btc['macro_trend'] = (btc['Close'] > btc['sma_200']).astype(int)
+    df_live['EMA_3'] = df_live['Close'].ewm(span=3, adjust=False).mean()
+    df_live['EMA_7'] = df_live['Close'].ewm(span=7, adjust=False).mean()
+    df_live['EMA_Cross'] = np.where(df_live['EMA_3'] > df_live['EMA_7'], 1, -1)
+
+    delta = df_live['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
+    rs = gain / (loss + 1e-9)
+    df_live['RSI_7'] = 100 - (100 / (1 + rs))
+
+    df_live['Vol_Rel_5d'] = df_live['Volume'] / df_live['Volume'].rolling(window=5).mean()
+
+    high_low = df_live['High'] - df_live['Low']
+    high_close = np.abs(df_live['High'] - df_live['Close'].shift())
+    low_close = np.abs(df_live['Low'] - df_live['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df_live['ATR_5'] = true_range.rolling(5).mean()
+    df_live['ATR_Norm'] = df_live['ATR_5'] / df_live['Close'] 
+
+    df_live['SMA_50'] = df_live['Close'].rolling(window=50).mean()
+
+    df_live = df_live.dropna()
+    hoy = df_live.iloc[-1:]
+
+    precio_actual = float(hoy['Close'].values[0])
+    sma_50_actual = float(hoy['SMA_50'].values[0])
+    regimen_alcista = precio_actual > sma_50_actual
+
+    print("Cargando el cerebro de la red neuronal (XGBoost)...")
+    modelo_xgb = joblib.load('xgboost_btc_short_term_v1.pkl')
+
+    features = ['Return', 'EMA_Cross', 'RSI_7', 'Vol_Rel_5d', 'ATR_Norm']
+    X_live = hoy[features]
     
-    HORIZONTE = 3
-    btc['Target'] = (btc['Close'].shift(-HORIZONTE) > btc['Close']).astype(int)
-    
-    # Separar datos de entrenamiento (quitamos los últimos 3 días sin target)
-    btc_train = btc.dropna().copy()
-    features = ['ret_1d', 'ret_3d', 'ret_5d', 'vol_14d', 'dist_sma_50', 'rsi_14', 'macro_trend']
-    X_train = btc_train[features]
-    y_train = btc_train['Target']
-    
-    print("Entrenando XGBoost...")
-    modelo_xgb = xgb.XGBClassifier(
-        n_estimators=100, max_depth=3, learning_rate=0.03, 
-        subsample=0.8, colsample_bytree=0.8, random_state=42
-    )
-    modelo_xgb.fit(X_train, y_train)
-    
-    print("Generando predicción de hoy...")
-    ultima_fila = btc[features].iloc[-1:]
-    precio_actual = float(btc['Close'].iloc[-1])
-    es_macro_alcista = bool(btc['macro_trend'].iloc[-1] == 1)
-    prob_alcista = float(modelo_xgb.predict_proba(ultima_fila)[:, 1][0])
-    
-    mensaje = f"🤖 *REPORTE DIARIO EQUIPO (XGBoost 3D)* 🤖\n\n"
+    prob_alcista = float(modelo_xgb.predict_proba(X_live)[:, 1][0])
+    umbral = 0.56
+    senal_xgboost = prob_alcista > umbral
+
+    print("Construyendo y enviando reporte...")
+    mensaje = f"🤖 *REPORTE DIARIO EQUIPO (XGBoost Corto Plazo)* 🤖\n\n"
     mensaje += f"💵 *Precio Actual BTC:* ${precio_actual:,.2f}\n"
-    mensaje += f"📈 *Tendencia Macro (SMA200):* {'ALCISTA 🟢' if es_macro_alcista else 'BAJISTA 🔴'}\n"
-    mensaje += f"🧠 *Confianza del Modelo:* {prob_alcista * 100:.1f}%\n\n"
+    mensaje += f"📈 *Filtro Macro (SMA50):* {'ALCISTA 🟢' if regimen_alcista else 'BAJISTA 🔴'}\n"
+    mensaje += f"🧠 *Certeza XGBoost:* {prob_alcista * 100:.2f}% (Req > {umbral*100}%)\n\n"
     
-    if prob_alcista >= 0.55 and es_macro_alcista:
-        mensaje += "🚀 *SEÑAL:* EJECUTAR COMPRA (Entrar a 3 días)"
-    elif prob_alcista < 0.50:
-        mensaje += "🛑 *SEÑAL:* VENDER / PERMANECER EN DÓLARES"
+    if regimen_alcista and senal_xgboost:
+        mensaje += "🚀 *SEÑAL:* 🟢 COMPRAR. Condiciones técnicas y macro alineadas."
+    elif regimen_alcista and not senal_xgboost:
+        mensaje += "🟡 *SEÑAL:* ESPERAR. Mercado alcista, pero sin momentum corto plazo."
     else:
-        mensaje += "⏳ *SEÑAL:* NEUTRAL (Esperar confirmación)"
+        mensaje += "🛑 *SEÑAL:* QUEDARSE EN USDT. Riesgo estructural alto."
         
     enviar_telegram(mensaje)
-    print("Proceso finalizado. Mensaje enviado.")
+    print("Proceso finalizado con éxito.")
 
 if __name__ == "__main__":
     ejecutar_estrategia()
